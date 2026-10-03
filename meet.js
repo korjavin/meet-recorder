@@ -1,10 +1,12 @@
-#!/usr/bin/env node
 'use strict';
 
-// Headless Google Meet audio recorder CLI (flags, exit codes, the stdout JSON
-// line, the stderr milestones). Joins as a guest (no Google account), knocks,
-// waits in the lobby, and records the call audio as a 16 kHz mono WAV.
-// See docs/recording.md.
+// Headless Google Meet audio recorder, as a library: record() joins as a guest
+// (no Google account), knocks, waits in the lobby, and records the call audio
+// as a 16 kHz mono WAV. See docs/recording.md.
+//
+// It owns no process state: no signal handlers, no process.exit, no stdout.
+// The caller stops a run with an AbortSignal. Every call gets its own
+// PulseAudio, Chromium and temp dir, so several runs share one process.
 //
 // How the audio is captured (proven in live Meet tests): Meet
 // only plays call audio to a participant that has media devices, so Chromium
@@ -18,9 +20,9 @@
 // off before joining and re-checked in the call, and lockMedia() disables every
 // captured track so Meet cannot re-enable it.
 //
-// Speaker hints (--captions-out): Meet gives no per-participant audio, but its
-// live captions name the speaker of every utterance. With the flag, captions
-// are turned on after admission (visible to participants — owner-approved) and
+// Speaker hints (captionsOut): Meet gives no per-participant audio, but its
+// live captions name the speaker of every utterance. With captionsOut set,
+// captions are turned on after admission (visible to participants — owner-approved) and
 // each finished utterance becomes one JSONL line {offset_s, speaker, text};
 // the transcriber aligns them to its own transcript. Captions failing never
 // affects the recording.
@@ -30,73 +32,21 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const USAGE = `usage: meet.js --url <https://meet.google.com/xxx-xxxx-xxx> --out <audio.wav>
-               [--join-timeout <sec, default 1200>]  (lobby wait incl. re-knocks)
-               [--max-duration <sec, default 14400>]
-               [--empty-grace <sec, default 60>]
-               [--display-name <str, default NoteTaker>]
-               [--tracks-dir <dir>]  (accepted and ignored: Meet has no per-participant audio)
-               [--captions-out <captions.jsonl>]  (Meet captions as speaker hints)
-`;
-
 const POLL_MS = 2000;
 // A guest knocking on a meeting nobody has opened yet gets "No one responded to
-// your request" after a while; it knocks again this often until --join-timeout.
+// your request" after a while; it knocks again this often until joinTimeoutS.
 const REKNOCK_MS = 60000;
 // Prejoin "Ask to join" clicked but the page still reads prejoin: click again.
 const RECLICK_MS = 10000;
 const RATE = 16000; // parec output: 16 kHz mono s16le, ~1.9 MB/min
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (msg) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
+const stderrLog = (msg) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
 const scrub = (msg) => String(msg).replace(/https?:\/\/\S+/g, '<url>');
 
-// Lobby wait including re-knocks when --join-timeout is not given.
-const JOIN_TIMEOUT_S = 1200;
-
-const DEFAULTS = {
-  url: '',
-  out: '',
-  joinTimeout: 600,
-  maxDuration: 14400,
-  emptyGrace: 60,
-  displayName: 'NoteTaker',
-};
-
-const FLAGS = {
-  '--url': 'url',
-  '--out': 'out',
-  '--tracks-dir': 'tracksDir',
-  '--join-timeout': 'joinTimeout',
-  '--max-duration': 'maxDuration',
-  '--empty-grace': 'emptyGrace',
-  '--display-name': 'displayName',
-};
-
-const NUMERIC = new Set(['joinTimeout', 'maxDuration', 'emptyGrace']);
-
-/** Strict flag/value pairs (without node/script). Throws on anything the CLI rejects. */
-function parseFlags(argv) {
-  const opts = { ...DEFAULTS };
-  for (let i = 0; i < argv.length; i++) {
-    const flag = argv[i];
-    const key = FLAGS[flag];
-    if (!key) throw new Error(`unknown argument: ${flag}`);
-    const value = argv[++i];
-    if (value === undefined) throw new Error(`missing value for ${flag}`);
-    if (NUMERIC.has(key)) {
-      const n = Number(value);
-      if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive number`);
-      opts[key] = n;
-    } else {
-      opts[key] = value;
-    }
-  }
-  if (!opts.url) throw new Error('missing required --url');
-  if (!opts.out) throw new Error('missing required --out');
-  // ponytail: --tracks-dir is accepted and ignored (Meet has no per-participant audio).
-  delete opts.tracksDir;
-  return opts;
+/** An Error carrying the job error code: 'not_admitted' | 'recorder_failed'. */
+function recordError(code, message, extra) {
+  return Object.assign(new Error(scrub(message)), { code }, extra);
 }
 
 /**
@@ -111,31 +61,6 @@ function shouldStop({ membersCount, aloneSince, now, emptyGrace, startedAt, maxD
   const since = alone ? (aloneSince ?? now) : null;
   if (alone && now - since >= emptyGrace * 1000) return { reason: 'empty_room', aloneSince: since };
   return { reason: null, aloneSince: since };
-}
-
-/** The single stdout line; `captions` only when the speaker-hint file has lines. */
-function resultLine({ out, durationS, reason, participants, captions }) {
-  const res = { out, duration_s: Math.round(durationS * 10) / 10, reason, participants };
-  if (captions) res.captions = captions;
-  return `${JSON.stringify(res)}\n`;
-}
-
-/** The generic flags and checks, plus: the URL must be a Meet meeting, the
- * --join-timeout default is JOIN_TIMEOUT_S, and --captions-out <path>. */
-function parseArgs(argv) {
-  // parseFlags takes strict flag/value pairs, so flags sit at even indices.
-  const at = argv.findIndex((a, i) => i % 2 === 0 && a === '--captions-out');
-  const captionsOut = at < 0 ? undefined : argv[at + 1];
-  if (at >= 0 && !captionsOut) throw new Error('missing value for --captions-out');
-  if (at >= 0) argv = [...argv.slice(0, at), ...argv.slice(at + 2)];
-  const opts = parseFlags(argv);
-  if (captionsOut) {
-    opts.captionsOut = path.resolve(captionsOut);
-    if (opts.captionsOut === path.resolve(opts.out)) throw new Error('--captions-out must differ from --out');
-  }
-  if (!argv.some((a, i) => i % 2 === 0 && a === '--join-timeout')) opts.joinTimeout = JOIN_TIMEOUT_S;
-  if (!/^https:\/\/meet\.google\.com\/./.test(opts.url)) throw new Error('--url must be a https://meet.google.com/... URL');
-  return opts;
 }
 
 /** The meeting code only — never log the URL (it may carry an authuser or a pwd). */
@@ -389,7 +314,7 @@ function readCaptions() {
  * never flips must not be toggled forever), then the 'c' shortcut. Never
  * clicks once captions read as on, so it cannot toggle them back off. The
  * caption language is left as the meeting has it: only speaker and time matter. */
-async function enableCaptions(page, stopped) {
+async function enableCaptions(page, stopped, log) {
   let pressed = false;
   let clicks = 0;
   for (let i = 0; i < 10 && !stopped(); i++) {
@@ -416,7 +341,7 @@ async function enableCaptions(page, stopped) {
  * make the room look empty. */
 function otherNames({ tiles, unnamed, names, self }, displayName) {
   // ponytail: one nameless tile (a placeholder, a share) disables the empty-room
-  // rule for that poll; --max-duration is the backstop.
+  // rule for that poll; maxDurationS is the backstop.
   if (!tiles || unnamed || !names.length) return null;
   const me = new Set([displayName, ...self].map((s) => s.toLowerCase()));
   return names.filter((n) => !me.has(n.toLowerCase()) && !/\(you\)$/i.test(n) && !/^you$/i.test(n));
@@ -481,7 +406,8 @@ function launchOpts(dir, server) {
     // --mute-audio: puppeteer mutes headless audio by default.
     ignoreDefaultArgs: ['--mute-audio', '--enable-automation'],
     env: { ...process.env, PULSE_SERVER: server },
-    // Shutdown is onSignal's job: the WAV must be finalized first.
+    // No process-level handlers: the caller's AbortSignal stops a run, and
+    // the WAV must be finalized before the browser goes.
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
@@ -494,9 +420,8 @@ function run(cmd, args, env) {
   p.err = '';
   p.stderr.on('data', (d) => (p.err = (p.err + d).slice(-500)));
   p.on('error', (e) => (p.err = e.message));
-  // A forced exit (second signal) skips the stop path: parec would keep growing
-  // the WAV and pulseaudio would outlive us.
-  process.on('exit', () => alive(p) && p.kill('SIGKILL'));
+  // ponytail: record()'s finally kills every child; a host process dying hard
+  // leaves them orphaned — the host's shutdown aborts its runs first.
   return p;
 }
 
@@ -576,45 +501,82 @@ function finalizeWav(file) {
   }
 }
 
-async function main(argv) {
-  let opts;
-  try {
-    opts = parseArgs(argv);
-  } catch (e) {
-    process.stderr.write(`error: ${scrub(e.message)}\n\n${USAGE}`);
-    return 2;
+/**
+ * Record one Meet call into `out` (16 kHz mono WAV; its parent dir is created,
+ * the file truncated). Resolves { durationS, reason, participants, captions }:
+ * `reason` = empty_room | max_duration | signal | ended | removed; `captions`
+ * = captionsOut when it got at least one line, else undefined. Rejects with an
+ * Error whose `code` is 'not_admitted' (denied, invalid meeting, join timeout,
+ * aborted before admission) or 'recorder_failed' (browser/page failure, or the
+ * capture died mid-call — the truncated WAV is kept and `err.durationS` says
+ * how much of it there is). Bad arguments throw a TypeError without a code.
+ *
+ * `signal` (AbortSignal) stops the run: parec gets SIGINT, the WAV header is
+ * finalized and the promise resolves with reason 'signal'. `onState` gets
+ * 'waiting_in_lobby' once, on the first knock, and 'joined' at admission.
+ * `log(msg)` gets the progress lines (default: timestamped stderr); it never
+ * sees the meeting URL.
+ */
+async function record({
+  url,
+  out,
+  captionsOut,
+  displayName = 'NoteTaker',
+  joinTimeoutS = 1200,
+  maxDurationS = 14400,
+  emptyGraceS = 60,
+  signal,
+  onState = () => {},
+  log = stderrLog,
+} = {}) {
+  if (!/^https:\/\/meet\.google\.com\/./.test(url || '')) throw new TypeError('url must be a https://meet.google.com/... URL');
+  if (!out) throw new TypeError('out is required');
+  out = path.resolve(out);
+  if (captionsOut) {
+    captionsOut = path.resolve(captionsOut);
+    if (captionsOut === out) throw new TypeError('captionsOut must differ from out');
   }
-  opts.out = path.resolve(opts.out);
-  fs.mkdirSync(path.dirname(opts.out), { recursive: true });
-  fs.rmSync(opts.out, { force: true }); // truncate semantics: a rerun never appends
-  if (opts.captionsOut) {
+  for (const [k, v] of Object.entries({ joinTimeoutS, maxDurationS, emptyGraceS })) {
+    if (!Number.isFinite(v) || v <= 0) throw new TypeError(`${k} must be a positive number`);
+  }
+  const state = (s) => {
     try {
-      fs.mkdirSync(path.dirname(opts.captionsOut), { recursive: true });
-      fs.rmSync(opts.captionsOut, { force: true });
+      onState(s);
     } catch (e) {
-      log(`captions: cannot prepare the output (${e.message}); recording without speaker hints`);
-      delete opts.captionsOut;
+      log(`onState threw: ${scrub(e.message)}`); // a caller bug never stops the recording
     }
-  }
+  };
 
   let reason = null;
-  const onSignal = (sig) => {
-    if (reason) {
-      log(`${sig} again — exiting immediately`);
-      process.exit(0);
-    }
+  const onAbort = () => {
+    if (reason) return;
     reason = 'signal';
-    log(`${sig} received — stopping`);
+    log('abort signal — stopping');
   };
-  process.on('SIGTERM', () => onSignal('SIGTERM'));
-  process.on('SIGINT', () => onSignal('SIGINT'));
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-'));
+  let dir = null;
   let pulse = null;
   let parec = null;
   let browser = null;
   let pageGone = false;
   try {
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.rmSync(out, { force: true }); // truncate semantics: a rerun never appends
+    if (captionsOut) {
+      try {
+        fs.mkdirSync(path.dirname(captionsOut), { recursive: true });
+        fs.rmSync(captionsOut, { force: true });
+      } catch (e) {
+        log(`captions: cannot prepare the output (${e.message}); recording without speaker hints`);
+        captionsOut = undefined;
+      }
+    }
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-'));
+
     let page;
     try {
       pulse = await startPulse(dir);
@@ -626,54 +588,55 @@ async function main(argv) {
       await page.evaluateOnNewDocument(lockMedia);
       // Meet may not play call audio to a guest without devices (seen in live Meet tests).
       await browser.defaultBrowserContext().overridePermissions('https://meet.google.com', ['camera', 'microphone']);
-      log(`joining room ${meetingCode(opts.url)} as ${opts.displayName}`);
+      log(`joining room ${meetingCode(url)} as ${displayName}`);
       page.on('close', () => (pageGone = true));
       page.on('error', () => (pageGone = true)); // the renderer crashed
-      await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch (e) {
-      log(`browser launch/page failure: ${scrub(e.message)}`);
-      return 4;
+      throw recordError('recorder_failed', `browser launch/page failure: ${e.message}`);
     }
 
     // --- join phase -------------------------------------------------------
-    const joinDeadline = Date.now() + opts.joinTimeout * 1000;
+    const joinDeadline = Date.now() + joinTimeoutS * 1000;
     let last = '';
     let nameTyped = false;
     let clickedAt = 0; // last "Ask to join" click
     let knocks = 0;
+    let knocked = false;
+    // waiting_in_lobby once, on the first knock: the first "Ask to join" click,
+    // or the lobby showing first (the poll can miss a short lobby, not the click).
+    const knock = () => !knocked && (knocked = true) && state('waiting_in_lobby');
     let admitted = false;
     while (!reason && Date.now() < joinDeadline) {
       if (!browser.connected || pageGone) {
-        log('browser launch/page failure: the Meet page closed or crashed before admission');
-        return 4;
+        throw recordError('recorder_failed', 'browser launch/page failure: the Meet page closed or crashed before admission');
       }
       const s = await page.evaluate(readState).catch((e) => ({ state: 'probe-error', why: scrub(e.message) }));
       if (s.state !== last) {
-        const shown = s.state === 'lobby' ? 'waiting_in_lobby' : s.state === 'admitted' ? 'joined' : s.state;
-        log(`state: ${shown} (${s.why})`);
+        log(`state: ${s.state} (${s.why})`);
         last = s.state;
       }
+      if (s.state === 'lobby' || s.state === 'unanswered') knock();
       if (s.state === 'admitted') {
         admitted = true;
         break;
       }
       if (['denied', 'blocked', 'invalid', 'removed', 'ended', 'signin'].includes(s.state)) {
-        log(`not admitted: ${s.state}`);
-        return 3;
+        throw recordError('not_admitted', `not admitted: ${s.state}`);
       }
       if (s.state === 'unanswered' && Date.now() - clickedAt >= REKNOCK_MS) {
         knocks++;
-        log(`state: waiting_in_lobby (no one responded; re-knock ${knocks})`);
+        log(`no one responded; re-knock ${knocks}`);
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => log(`reload failed: ${scrub(e.message)}`));
         nameTyped = false;
         clickedAt = 0;
         last = '';
       } else if (s.state === 'prejoin' && Date.now() - clickedAt >= RECLICK_MS) {
-        const p = await page.evaluate(prejoin, opts.displayName).catch((e) => ({ mic: '?', cam: '?', error: scrub(e.message) }));
+        const p = await page.evaluate(prejoin, displayName).catch((e) => ({ mic: '?', cam: '?', error: scrub(e.message) }));
         // Never join while the mic or camera reads on: the next pass confirms the clicks.
         if (p.mic !== 'on' && p.cam !== 'on' && !p.error) {
           if (p.needsName && !nameTyped) {
-            await page.type('input[aria-label="Your name" i], input[placeholder="Your name" i], input[type="text"][autocomplete="name"]', opts.displayName, { delay: 60 }).catch(() => {});
+            await page.type('input[aria-label="Your name" i], input[placeholder="Your name" i], input[type="text"][autocomplete="name"]', displayName, { delay: 60 }).catch(() => {});
             nameTyped = true;
             await sleep(500);
           }
@@ -682,28 +645,27 @@ async function main(argv) {
           if (clicked) {
             clickedAt = Date.now();
             log(`clicked "${clicked}"`);
+            knock();
           }
         }
       }
       await sleep(POLL_MS);
     }
-    if (!admitted) {
-      log(reason === 'signal' ? 'stopped before joining' : 'join timeout');
-      return 3;
-    }
+    if (!admitted) throw recordError('not_admitted', reason === 'signal' ? 'aborted before joining' : 'join timeout');
+    state('joined');
 
     // --- record phase -----------------------------------------------------
     // parec starts at admission: the WAV is the call, not the prejoin screen.
-    parec = startParec(pulse.server, opts.out);
+    parec = startParec(pulse.server, out);
     const startedAt = Date.now();
-    log(`recording -> ${opts.out}`);
+    log('recording');
     let aloneSince = null;
     let failure = null;
     const participants = new Set(); // first-seen order
     // Captions as speaker hints: one JSONL line per finished utterance.
     const cap = { st: { open: new Map(), done: new Set() }, lines: 0, prev: 0 };
     const pollCaptions = async (flush) => {
-      if (!opts.captionsOut) return;
+      if (!captionsOut) return;
       const r = await page.evaluate(readCaptions).catch(() => null);
       // A failed read is not "every block left": keep the open ones for the next poll.
       if (!r && !flush) return;
@@ -711,14 +673,14 @@ async function main(argv) {
         const h = captionHint(u, startedAt, cap.prev);
         cap.prev = h.offset_s;
         try {
-          fs.appendFileSync(opts.captionsOut, JSON.stringify(h) + '\n');
+          fs.appendFileSync(captionsOut, JSON.stringify(h) + '\n');
           cap.lines++;
         } catch (e) {
           log(`captions: write failed: ${e.message}`); // hints are optional; the recording goes on
         }
       }
     };
-    if (opts.captionsOut) await enableCaptions(page, () => reason);
+    if (captionsOut) await enableCaptions(page, () => reason, log);
     for (let tick = 0; !reason && !failure; tick++) {
       // Every 10 s (and right away): Meet's mic/camera toggles stay off.
       if (tick % 5 === 0) {
@@ -733,22 +695,22 @@ async function main(argv) {
       if (!alive(parec)) failure = `audio capture (parec) exited mid-call: ${parec.err.trim().split('\n').pop() || 'no error'}`;
       else if (!alive(pulse.proc)) failure = 'pulseaudio exited mid-call';
       else if (!browser.connected || pageGone) failure = 'the Meet page closed or crashed mid-call';
-      if (failure) break;
+      if (failure || reason) break;
       const s = await page.evaluate(readState).catch(() => ({ state: 'probe-error' }));
       if (s.state === 'ended' || s.state === 'removed') {
         reason = s.state;
         break;
       }
       const names = await page.evaluate(readNames).catch(() => null);
-      const others = names ? otherNames(names, opts.displayName) : null;
+      const others = names ? otherNames(names, displayName) : null;
       for (const n of others || []) participants.add(n);
       const next = meetShouldStop({
         others,
         aloneSince,
         now: Date.now(),
-        emptyGrace: opts.emptyGrace,
+        emptyGrace: emptyGraceS,
         startedAt,
-        maxDuration: opts.maxDuration,
+        maxDuration: maxDurationS,
       });
       aloneSince = next.aloneSince;
       if (next.reason) reason = next.reason;
@@ -756,45 +718,28 @@ async function main(argv) {
 
     log(`stopping: ${failure ? 'failed' : reason}`);
     await pollCaptions(true);
-    if (opts.captionsOut) log(`captions: ${cap.lines} utterance(s)`);
+    if (captionsOut) log(`captions: ${cap.lines} utterance(s)`);
     await stopProc(parec);
-    const pcm = finalizeWav(opts.out);
-    if (failure) {
-      log(`${failure} — the recording is truncated`);
-      return 5;
-    }
-    if (!pcm) {
-      log(`output missing or empty: ${opts.out}`);
-      return 5;
-    }
-    const durationS = pcm / (RATE * 2);
-    const size = fs.statSync(opts.out).size;
-    log(`wrote ${size} bytes in ${durationS.toFixed(1)}s, ${participants.size} participant(s)`);
-    const captions = cap.lines ? opts.captionsOut : undefined;
-    process.stdout.write(resultLine({ out: opts.out, durationS, reason, participants: [...participants], captions }));
-    return 0;
+    const pcm = finalizeWav(out);
+    const durationS = Math.round((pcm / (RATE * 2)) * 10) / 10;
+    if (failure) throw recordError('recorder_failed', `${failure} — the recording is truncated`, { durationS });
+    if (!pcm) throw recordError('recorder_failed', 'the recording is missing or empty', { durationS });
+    log(`wrote ${durationS}s, ${participants.size} participant(s)`);
+    return { durationS, reason, participants: [...participants], captions: cap.lines ? captionsOut : undefined };
+  } catch (e) {
+    if (e.code === 'not_admitted' || e.code === 'recorder_failed') throw e;
+    throw recordError('recorder_failed', `unexpected: ${e && e.stack ? e.stack : e}`);
   } finally {
+    if (signal) signal.removeEventListener('abort', onAbort);
     if (browser) await browser.close().catch(() => {});
     await stopProc(parec);
     if (pulse) await stopProc(pulse.proc);
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
-if (require.main === module) {
-  main(process.argv.slice(2)).then(
-    (code) => process.exit(code),
-    (e) => {
-      log(`fatal: ${scrub(e && e.stack ? e.stack : e)}`);
-      process.exit(4);
-    },
-  );
-}
-
 module.exports = {
-  USAGE,
-  main,
-  parseArgs,
+  record,
   meetingCode,
   meetShouldStop,
   otherNames,
