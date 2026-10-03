@@ -39,13 +39,19 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
 
   /** One attempt. Resolves on 2xx, rejects otherwise. Redirects are not followed. */
   async function post(callbackUrl, event, body) {
-    const res = await fetch(callbackUrl, {
-      method: 'POST',
-      body,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-      headers: { 'content-type': 'application/json', 'x-recorder-event': event, 'x-recorder-signature': sign(secret, body) },
-    });
+    let res;
+    try {
+      res = await fetch(callbackUrl, {
+        method: 'POST',
+        body,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+        headers: { 'content-type': 'application/json', 'x-recorder-event': event, 'x-recorder-signature': sign(secret, body) },
+      });
+    } catch (e) {
+      // fetch errors may quote the URL, which may carry credentials: log only the kind.
+      throw new Error((e.cause && e.cause.code) || e.name);
+    }
     await res.arrayBuffer().catch(() => {}); // drain so the connection can be reused
     if (res.status < 200 || res.status > 299) throw new Error(`http ${res.status}`);
   }
@@ -85,7 +91,7 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
         }
       }
     } catch (e) {
-      log(`outbox ${file}: ${e.message}`);
+      log(`outbox ${file}: unreadable (${e.code || e.name})`); // a JSON error quotes the file, URL included
     } finally {
       inFlight.delete(file);
     }

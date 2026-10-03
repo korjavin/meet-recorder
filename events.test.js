@@ -127,6 +127,16 @@ test('best-effort events: one attempt, no outbox', async (t) => {
   assert.deepStrictEqual(Object.keys(store.load('job1').delivered), ['recording.started']);
 });
 
+test('delivery errors never log the callback URL', async (t) => {
+  const { job, store } = setup(t, 'http://user:hunter2@127.0.0.1:1/events?token=private');
+  const logs = [];
+  const o = createOutbox({ secret: SECRET, dataDir: path.dirname(store.dir('x')), store, log: (m) => logs.push(m), backoff: [] });
+  await o.emit(job, 'recording.started');
+  await o.emit({ ...job, callback_url: 'http://127.0.0.1:1/events?token=private' }, 'recording.failed');
+  assert.strictEqual(logs.length, 2);
+  assert.ok(!logs.join('\n').match(/hunter2|private/), logs.join('\n'));
+});
+
 test('the server delivers through its outbox by default', async (t) => {
   const r = await receiver(t, [200]);
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-ev-'));
