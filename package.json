@@ -5,7 +5,7 @@
   "description": "Headless Google Meet audio recorder",
   "main": "server.js",
   "scripts": {
-    "test": "node --check meet.js && node --test meet.test.js server.test.js"
+    "test": "node --check meet.js && node --test meet.test.js server.test.js events.test.js"
   },
   "dependencies": {
     "puppeteer": "^24.10.0"
