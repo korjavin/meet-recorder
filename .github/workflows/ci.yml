@@ -25,3 +25,9 @@ jobs:
       - run: docker build -t meet-recorder .
       # End to end in the image: Chromium + PulseAudio + parec on a fake Meet page.
       - run: docker run --rm --shm-size=512m --entrypoint node meet-recorder --test meet.test.js
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env && docker compose config -q
