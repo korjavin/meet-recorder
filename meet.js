@@ -539,11 +539,13 @@ async function record({
   for (const [k, v] of Object.entries({ joinTimeoutS, maxDurationS, emptyGraceS })) {
     if (!Number.isFinite(v) || v <= 0) throw new TypeError(`${k} must be a positive number`);
   }
+  // A caller bug (a throw or a rejected promise) never stops the recording.
   const state = (s) => {
+    const bad = (e) => log(`onState threw: ${scrub(e && e.message)}`);
     try {
-      onState(s);
+      Promise.resolve(onState(s)).catch(bad);
     } catch (e) {
-      log(`onState threw: ${scrub(e.message)}`); // a caller bug never stops the recording
+      bad(e);
     }
   };
 
@@ -553,10 +555,8 @@ async function record({
     reason = 'signal';
     log('abort signal — stopping');
   };
-  if (signal) {
-    if (signal.aborted) onAbort();
-    else signal.addEventListener('abort', onAbort, { once: true });
-  }
+  if (signal && signal.aborted) throw recordError('not_admitted', 'aborted before joining');
+  if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
   let dir = null;
   let pulse = null;

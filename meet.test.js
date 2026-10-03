@@ -68,6 +68,7 @@ test('record rejects bad arguments before starting anything', async () => {
   await assert.rejects(record({ url: URL }), /out is required/);
   await assert.rejects(record({ url: URL, out, captionsOut: '/tmp/../tmp/a.wav' }), /differ from out/);
   await assert.rejects(record({ url: URL, out, joinTimeoutS: 0 }), /joinTimeoutS must be a positive number/);
+  await assert.rejects(record({ url: URL, out: '/nonexistent/a.wav', signal: AbortSignal.abort() }), { code: 'not_admitted' }, 'already aborted: nothing starts');
 });
 
 test('meetingCode logs the code, never the rest of the URL', () => {
