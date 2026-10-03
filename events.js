@@ -32,10 +32,11 @@ function buildEvent(job, event, at = new Date().toISOString()) {
 
 /**
  * store: { dir(id), load(id), save(job) } over DATA_DIR/<id>/job.json.
- * Returns { emit(job, event), sweep(), start() }.
+ * Returns { emit(job, event), sweep(), start(), flush() }.
  */
 function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
-  const inFlight = new Set(); // outbox files with a delivery loop running
+  const inFlight = new Map(); // outbox file -> { done, wake } of its running delivery loop
+  let flushing = false; // shutdown: every loop makes one more attempt, then stops
 
   /** One attempt. Resolves on 2xx, rejects otherwise. Redirects are not followed. */
   async function post(callbackUrl, event, body) {
@@ -69,9 +70,15 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
   }
 
   /** Deliver an outbox file, retrying on `schedule`; the file stays until a 2xx. */
-  async function deliver(file, job, schedule) {
-    if (inFlight.has(file)) return;
-    inFlight.add(file);
+  function deliver(file, job, schedule) {
+    if (inFlight.has(file)) return inFlight.get(file).done;
+    const loop = { wake: null };
+    inFlight.set(file, loop);
+    loop.done = run(file, job, schedule, loop).finally(() => inFlight.delete(file));
+    return loop.done;
+  }
+
+  async function run(file, job, schedule, loop) {
     try {
       const { callback_url, event, id, body } = JSON.parse(fs.readFileSync(file, 'utf8'));
       for (let attempt = 0; ; attempt++) {
@@ -82,18 +89,20 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
           log(`job ${id}: ${event} delivered (attempt ${attempt + 1})`);
           return;
         } catch (e) {
-          if (attempt >= schedule.length) {
+          if (attempt >= schedule.length || flushing) {
             log(`job ${id}: ${event} not delivered (${e.message}); left in the outbox`);
             return;
           }
           log(`job ${id}: ${event} failed (${e.message}), retry in ${schedule[attempt] / 1000}s`);
-          await new Promise((r) => setTimeout(r, schedule[attempt]).unref());
+          await new Promise((r) => {
+            loop.wake = r;
+            setTimeout(r, schedule[attempt]).unref();
+          });
+          loop.wake = null;
         }
       }
     } catch (e) {
       log(`outbox ${file}: unreadable (${e.code || e.name})`); // a JSON error quotes the file, URL included
-    } finally {
-      inFlight.delete(file);
     }
   }
 
@@ -147,7 +156,14 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
     setInterval(sweep, SWEEP_MS).unref();
   }
 
-  return { emit, sweep, start };
+  /** Shutdown: one last attempt for every undelivered event, retries cut short. */
+  function flush() {
+    flushing = true;
+    for (const loop of inFlight.values()) if (loop.wake) loop.wake();
+    return sweep();
+  }
+
+  return { emit, sweep, start, flush };
 }
 
 module.exports = { createOutbox, buildEvent, sign, BACKOFF_MS };

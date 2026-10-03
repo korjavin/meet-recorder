@@ -3,12 +3,16 @@
 // The HTTP API (docs/architecture.md §3): POST /recordings starts record() in
 // the background, GET /recordings/{id} returns the job record, GET /health.
 // Every job lives in DATA_DIR/<id>/job.json, written atomically.
+// Failure handling (§4): server.recover() at startup, server.shutdown() on
+// SIGTERM/SIGINT. A hard death of the process takes its Chromium, PulseAudio
+// and parec children with it: node is the container's PID 1, so the container
+// restart clears them and nothing here hunts orphans.
 
 const http = require('node:http');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { record: realRecord, meetingCode } = require('./meet.js');
+const { record: realRecord, meetingCode, finalizeWav } = require('./meet.js');
 const { createOutbox } = require('./events.js');
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -111,7 +115,35 @@ function jobStore(dataDir) {
   };
 }
 
-/** The HTTP server; `server.outbox` is the event outbox (null when `emit` is injected). */
+const RATE_BYTES = 16000 * 2; // 16 kHz mono s16le
+
+/**
+ * Repair the job's WAV header from the file length and list what is on disk:
+ * { durationS, artifacts }. A partial recording is kept and reported; a bare
+ * 44-byte header is no recording.
+ */
+function partialArtifacts(dir) {
+  const audio = path.join(dir, 'audio.wav');
+  const captions = path.join(dir, 'captions.jsonl');
+  const size = (f) => {
+    try {
+      return fs.statSync(f).size;
+    } catch {
+      return 0;
+    }
+  };
+  const pcm = finalizeWav(audio);
+  if (size(audio) <= 44) return { durationS: null, artifacts: [] };
+  const artifacts = [{ kind: 'audio', path: audio, format: 'wav' }];
+  if (size(captions) > 0) artifacts.push({ kind: 'captions', path: captions });
+  return { durationS: Math.round((pcm / RATE_BYTES) * 10) / 10, artifacts };
+}
+
+/**
+ * The HTTP server; `server.outbox` is the event outbox (null when `emit` is
+ * injected), `server.recover()` fails jobs a dead process left running,
+ * `server.shutdown()` stops every running job and flushes the outbox once.
+ */
 function createServer({ config, record = realRecord, emit, log = stderrLog }) {
   const quiet = ['warn', 'error'].includes(config.logLevel);
   const store = jobStore(config.dataDir);
@@ -125,6 +157,8 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
       log(`job ${job.id}: emit ${event} failed: ${e.message}`);
     }
   };
+  const running = new Map(); // job id -> { abort, done }
+  let stopping = false;
   const update = (job, patch) => {
     Object.assign(job, patch);
     try {
@@ -144,7 +178,8 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
       if (captionsPath) list.push({ kind: 'captions', path: captionsPath });
       return list;
     };
-    Promise.resolve()
+    const ac = new AbortController();
+    const done = Promise.resolve()
       .then(() =>
         record({
           url: job.url,
@@ -154,6 +189,7 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
           joinTimeoutS: job.join_timeout_s,
           maxDurationS: job.max_duration_s,
           emptyGraceS: job.empty_grace_s,
+          signal: ac.signal,
           // LOG_LEVEL warn|error silences record()'s progress lines.
           log: quiet ? () => {} : (msg) => log(`job ${job.id}: ${msg}`),
           onState: (s) => {
@@ -179,26 +215,58 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
           send(job, 'recording.finished');
         },
         (e) => {
-          const error = e && e.code === 'not_admitted' ? 'not_admitted' : 'recorder_failed';
-          const size = (f) => {
-            try {
-              return fs.statSync(f).size;
-            } catch {
-              return 0;
-            }
-          };
-          // A partial recording is kept and reported; 44 bytes is a bare WAV header.
+          // Stopped by a signal before it was admitted: there is nothing to finish.
+          const error = e && e.code === 'not_admitted' ? (ac.signal.aborted ? 'interrupted' : 'not_admitted') : 'recorder_failed';
+          // record() may have died before finalizing the WAV header.
+          const part = partialArtifacts(dir);
           update(job, {
             state: 'failed',
             error,
             ended_at: new Date().toISOString(),
-            duration_s: e && e.durationS != null ? e.durationS : null,
-            artifacts: size(audio) > 44 ? artifacts(size(captions) > 0 && captions) : [],
+            duration_s: e && e.durationS != null ? e.durationS : part.durationS,
+            artifacts: part.artifacts,
           });
           log(`job ${job.id}: failed (${error}): ${e && e.message}`);
           send(job, 'recording.failed');
         },
-      );
+      )
+      .catch((e) => log(`job ${job.id}: ${e.message}`))
+      .finally(() => running.delete(job.id));
+    running.set(job.id, { abort: () => ac.abort(), done });
+  }
+
+  /** Startup: every job a dead process left joining/recording becomes failed/interrupted. */
+  function recover() {
+    let ids = [];
+    try {
+      ids = fs.readdirSync(path.resolve(config.dataDir));
+    } catch (e) {
+      if (e.code !== 'ENOENT') log(`recover: ${e.message}`);
+    }
+    for (const id of ids) {
+      let job;
+      try {
+        job = ID_RE.test(id) && load(id);
+      } catch (e) {
+        log(`job ${id}: unreadable job.json (${e.code || e.name})`);
+        continue;
+      }
+      if (!job || (job.state !== 'joining' && job.state !== 'recording') || running.has(id)) continue;
+      const part = partialArtifacts(jobDir(id));
+      update(job, { state: 'failed', error: 'interrupted', ended_at: new Date().toISOString(), duration_s: part.durationS, artifacts: part.artifacts });
+      log(`job ${id}: interrupted by a restart (${part.durationS || 0}s on disk)`);
+      send(job, 'recording.failed');
+    }
+  }
+
+  /** Stop every running job (finished, reason "signal"), then one last delivery attempt. */
+  async function shutdown() {
+    stopping = true;
+    const jobs = [...running.values()];
+    if (jobs.length) log(`stopping ${jobs.length} running job(s)`);
+    for (const j of jobs) j.abort();
+    await Promise.all(jobs.map((j) => j.done));
+    if (outbox) await outbox.flush();
   }
 
   function reply(res, status, obj) {
@@ -235,6 +303,7 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
     } catch {
       return reply(res, 400, { error: 'body must be JSON' });
     }
+    if (stopping) return reply(res, 503, { error: 'shutting down' });
     const p = parseRequest(body, config);
     if (p.error) return reply(res, p.status, { error: p.error });
     // Synchronous from here to save(): a concurrent retry sees the file.
@@ -253,11 +322,10 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
       else res.destroy();
     });
   });
-  server.outbox = outbox;
-  return server;
+  return Object.assign(server, { outbox, recover, shutdown });
 }
 
-module.exports = { createServer, jobStore, validSignature, meetCode, parseRequest };
+module.exports = { createServer, jobStore, validSignature, meetCode, parseRequest, partialArtifacts };
 
 if (require.main === module) {
   const { loadConfig } = require('./config.js');
@@ -269,6 +337,23 @@ if (require.main === module) {
     process.exit(1);
   }
   const server = createServer({ config });
+  server.recover();
   server.outbox.start();
+  let signalled = false;
+  const onSignal = (sig) => {
+    if (signalled) process.exit(1); // a second signal: exit at once
+    signalled = true;
+    stderrLog(`${sig}: shutting down`);
+    server.close();
+    server.shutdown().then(
+      () => process.exit(0),
+      (e) => {
+        stderrLog(`shutdown: ${e.message}`);
+        process.exit(1);
+      },
+    );
+  };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
   server.listen(config.port, () => stderrLog(`listening on :${config.port}, data in ${config.dataDir}`));
 }
