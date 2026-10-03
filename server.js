@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { record: realRecord, meetingCode } = require('./meet.js');
+const { createOutbox } = require('./events.js');
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_BODY = 1 << 20;
@@ -83,29 +84,40 @@ function parseRequest(body, config) {
       reason: null,
       participants: [],
       artifacts: [],
+      delivered: {}, // event name -> time the receiver answered 2xx
     },
   };
 }
 
+/** DATA_DIR/<id>/job.json, written atomically (temp file + rename). */
+function jobStore(dataDir) {
+  const dir = (id) => path.join(path.resolve(dataDir), id);
+  const file = (id) => path.join(dir(id), 'job.json');
+  return {
+    dir,
+    save(job) {
+      const tmp = `${file(job.id)}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(job, null, 2));
+      fs.renameSync(tmp, file(job.id));
+    },
+    load(id) {
+      try {
+        return JSON.parse(fs.readFileSync(file(id), 'utf8'));
+      } catch (e) {
+        if (e.code === 'ENOENT') return null;
+        throw e;
+      }
+    },
+  };
+}
+
+/** The HTTP server; `server.outbox` is the event outbox (null when `emit` is injected). */
 function createServer({ config, record = realRecord, emit, log = stderrLog }) {
   const quiet = ['warn', 'error'].includes(config.logLevel);
-  const jobDir = (id) => path.join(path.resolve(config.dataDir), id);
-  const jobFile = (id) => path.join(jobDir(id), 'job.json');
-  const save = (job) => {
-    const tmp = `${jobFile(job.id)}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(job, null, 2));
-    fs.renameSync(tmp, jobFile(job.id));
-  };
-  const load = (id) => {
-    try {
-      return JSON.parse(fs.readFileSync(jobFile(id), 'utf8'));
-    } catch (e) {
-      if (e.code === 'ENOENT') return null;
-      throw e;
-    }
-  };
-  // ponytail: events are not delivered yet; the outbox bead replaces this.
-  emit = emit || ((job, event) => log(`job ${job.id}: ${event} (delivery not implemented)`));
+  const store = jobStore(config.dataDir);
+  const { save, load, dir: jobDir } = store;
+  const outbox = emit ? null : createOutbox({ secret: config.secret, dataDir: path.resolve(config.dataDir), store, log });
+  emit = emit || outbox.emit;
   const send = (job, event) => {
     try {
       Promise.resolve(emit(job, event)).catch((e) => log(`job ${job.id}: emit ${event} failed: ${e.message}`));
@@ -234,16 +246,18 @@ function createServer({ config, record = realRecord, emit, log = stderrLog }) {
     return reply(res, 202, { id: p.job.id, state: p.job.state });
   }
 
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
       log(`${req.method} ${req.url.split('?')[0]}: ${e.message}`);
       if (!res.headersSent) reply(res, 500, { error: 'internal error' });
       else res.destroy();
     });
   });
+  server.outbox = outbox;
+  return server;
 }
 
-module.exports = { createServer, validSignature, meetCode, parseRequest };
+module.exports = { createServer, jobStore, validSignature, meetCode, parseRequest };
 
 if (require.main === module) {
   const { loadConfig } = require('./config.js');
@@ -254,5 +268,7 @@ if (require.main === module) {
     stderrLog(`config: ${e.message}`);
     process.exit(1);
   }
-  createServer({ config }).listen(config.port, () => stderrLog(`listening on :${config.port}, data in ${config.dataDir}`));
+  const server = createServer({ config });
+  server.outbox.start();
+  server.listen(config.port, () => stderrLog(`listening on :${config.port}, data in ${config.dataDir}`));
 }
