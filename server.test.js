@@ -38,7 +38,7 @@ async function setup(t) {
     });
     return { status: res.status, json: await res.json() };
   };
-  return { dataDir, calls, events, req };
+  return { dataDir, calls, events, req, srv };
 }
 
 const ok = (over) => ({ id: 'job1', url: 'https://meet.google.com/abc-defg-hij', callback_url: 'http://bot:8080/events', meta: { k: [1] }, ...over });
@@ -153,4 +153,94 @@ test('a failed job keeps its partial audio, or reports none', async (t) => {
   const b = (await req('GET', '/recordings/b')).json;
   assert.deepStrictEqual([b.state, b.error, b.artifacts], ['failed', 'not_admitted', []]);
   assert.deepStrictEqual(events, [['a', 'recording.failed'], ['b', 'recording.failed']]);
+});
+
+/** A WAV as parec leaves it when killed: placeholder header sizes, `pcm` bytes of audio. */
+function killedWav(file, pcm) {
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0, 'latin1');
+  h.writeUInt32LE(0xffffffff, 4);
+  h.write('WAVEfmt ', 8, 'latin1');
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(16000, 24);
+  h.writeUInt32LE(32000, 28);
+  h.writeUInt16LE(2, 32);
+  h.writeUInt16LE(16, 34);
+  h.write('data', 36, 'latin1');
+  h.writeUInt32LE(0xffffffff, 40);
+  fs.writeFileSync(file, Buffer.concat([h, Buffer.alloc(pcm)]));
+}
+const wavSizes = (file) => {
+  const b = fs.readFileSync(file);
+  return [b.readUInt32LE(4), b.readUInt32LE(40)];
+};
+
+test('a record() that throws mid-call is recorder_failed with its WAV header repaired', async (t) => {
+  const { req, calls, events } = await setup(t);
+  await req('POST', '/recordings', ok());
+  const { opts } = calls[0];
+  opts.onState('joined');
+  killedWav(opts.out, 64000);
+  fs.writeFileSync(opts.captionsOut, '{}\n');
+  calls[0].reject(new TypeError('page crashed'));
+  await tick();
+  const j = (await req('GET', '/recordings/job1')).json;
+  assert.deepStrictEqual([j.state, j.error, j.duration_s], ['failed', 'recorder_failed', 2]);
+  assert.deepStrictEqual(j.artifacts, [
+    { kind: 'audio', path: opts.out, format: 'wav' },
+    { kind: 'captions', path: opts.captionsOut },
+  ]);
+  assert.deepStrictEqual(wavSizes(opts.out), [64036, 64000]);
+  assert.deepStrictEqual(events.at(-1), ['job1', 'recording.failed']);
+});
+
+test('startup: jobs left joining/recording become failed/interrupted, partial audio repaired', async (t) => {
+  const { dataDir, req, srv, events } = await setup(t);
+  const leave = (id, state) => {
+    fs.mkdirSync(path.join(dataDir, id));
+    const job = { ...ok({ id }), state, error: null, artifacts: [], delivered: {} };
+    fs.writeFileSync(path.join(dataDir, id, 'job.json'), JSON.stringify(job));
+    return path.join(dataDir, id);
+  };
+  const rec = leave('rec', 'recording');
+  killedWav(path.join(rec, 'audio.wav'), 32000);
+  fs.writeFileSync(path.join(rec, 'captions.jsonl'), '{}\n');
+  leave('join', 'joining');
+  leave('done', 'finished');
+  fs.mkdirSync(path.join(dataDir, 'not-a-job'));
+  srv.recover();
+
+  const r = (await req('GET', '/recordings/rec')).json;
+  assert.deepStrictEqual([r.state, r.error, r.duration_s], ['failed', 'interrupted', 1]);
+  assert.deepStrictEqual(r.artifacts, [
+    { kind: 'audio', path: path.join(rec, 'audio.wav'), format: 'wav' },
+    { kind: 'captions', path: path.join(rec, 'captions.jsonl') },
+  ]);
+  assert.deepStrictEqual(wavSizes(path.join(rec, 'audio.wav')), [32036, 32000]);
+  const j = (await req('GET', '/recordings/join')).json;
+  assert.deepStrictEqual([j.state, j.error, j.artifacts], ['failed', 'interrupted', []]);
+  assert.strictEqual((await req('GET', '/recordings/done')).json.state, 'finished');
+  assert.deepStrictEqual(events.sort(), [['join', 'recording.failed'], ['rec', 'recording.failed']]);
+});
+
+test('shutdown stops running jobs: a recording finishes with reason signal, a joining one is interrupted', async (t) => {
+  const { req, calls, events, srv } = await setup(t);
+  await req('POST', '/recordings', ok({ id: 'rec' }));
+  await req('POST', '/recordings', ok({ id: 'join' }));
+  calls[0].opts.onState('joined');
+  // Like record(): an abort after joining resolves, before joining rejects.
+  calls[0].opts.signal.addEventListener('abort', () => {
+    fs.writeFileSync(calls[0].opts.out, Buffer.alloc(100));
+    calls[0].resolve({ durationS: 3, reason: 'signal', participants: [] });
+  });
+  calls[1].opts.signal.addEventListener('abort', () => calls[1].reject(Object.assign(new Error('aborted before joining'), { code: 'not_admitted' })));
+  await srv.shutdown();
+  const r = (await req('GET', '/recordings/rec')).json;
+  assert.deepStrictEqual([r.state, r.reason, r.duration_s], ['finished', 'signal', 3]);
+  const j = (await req('GET', '/recordings/join')).json;
+  assert.deepStrictEqual([j.state, j.error], ['failed', 'interrupted']);
+  assert.deepStrictEqual(events.slice(-2).sort(), [['join', 'recording.failed'], ['rec', 'recording.finished']]);
+  assert.strictEqual((await req('POST', '/recordings', ok({ id: 'late' }))).status, 503);
 });

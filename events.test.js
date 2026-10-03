@@ -155,3 +155,15 @@ test('the server delivers through its outbox by default', async (t) => {
   assert.deepStrictEqual(r.got.map((g) => g.headers['x-recorder-event']), ['recording.finished']);
   assert.deepStrictEqual(fs.readdirSync(path.join(dataDir, 'j', 'outbox')), []);
 });
+
+test('flush cuts a retry wait short: one last attempt, then the event stays on disk', async (t) => {
+  const down = await receiver(t, [503]);
+  const { job, outbox, pending } = setup(t, down.url);
+  const o = outbox([3600e3]);
+  const delivering = o.emit(job, 'recording.finished');
+  while (down.got.length < 1) await new Promise((r) => setTimeout(r, 5));
+  await o.flush();
+  await delivering;
+  assert.strictEqual(down.got.length, 2, 'the hour-long wait was skipped');
+  assert.deepStrictEqual(pending(), ['recording.finished.json']);
+});
