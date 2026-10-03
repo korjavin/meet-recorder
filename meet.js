@@ -581,7 +581,7 @@ async function main(argv) {
   try {
     opts = parseArgs(argv);
   } catch (e) {
-    process.stderr.write(`error: ${e.message}\n\n${USAGE}`);
+    process.stderr.write(`error: ${scrub(e.message)}\n\n${USAGE}`);
     return 2;
   }
   opts.out = path.resolve(opts.out);
@@ -643,6 +643,10 @@ async function main(argv) {
     let knocks = 0;
     let admitted = false;
     while (!reason && Date.now() < joinDeadline) {
+      if (!browser.connected || pageGone) {
+        log('browser launch/page failure: the Meet page closed or crashed before admission');
+        return 4;
+      }
       const s = await page.evaluate(readState).catch((e) => ({ state: 'probe-error', why: scrub(e.message) }));
       if (s.state !== last) {
         const shown = s.state === 'lobby' ? 'waiting_in_lobby' : s.state === 'admitted' ? 'joined' : s.state;
