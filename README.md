@@ -69,7 +69,7 @@ Docker network.
    webhook URL.
 
 Every push to `master` then runs `.github/workflows/deploy.yml`: it builds and
-pushes `ghcr.io/<owner>/meet-recorder:<sha>`, rewrites the image tag on the
+pushes `ghcr.io/<owner>/meet-recorder:<sha>` (and `:latest`), rewrites the image tag on the
 `deploy` branch and calls the webhook (skipped when the secret is unset). The
 host must be able to pull the GHCR package (public, or a registry login in
 Portainer).

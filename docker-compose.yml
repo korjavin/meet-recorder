@@ -20,10 +20,13 @@ services:
       - DATA_DIR=/data/meet
     volumes:
       - recordings:/data
-    # Internal only: no ports, no Traefik labels. The orchestrator reaches it
+    # Internal only: no ports, no Traefik route. The orchestrator reaches it
     # as http://meet-recorder:8080 over the shared network.
     networks:
       - traefik
+    labels:
+      # Keeps it unrouted even when Traefik runs with exposedByDefault=true.
+      - "traefik.enable=false"
     # Chromium needs more than Docker's 64 MB default /dev/shm.
     shm_size: "1g"
     # On SIGTERM every running job finalizes its WAV and its terminal event is
