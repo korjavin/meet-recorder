@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "meet_recorder",
+  "project_id": "a4443805-1b1e-41e2-834a-cf584d28207c"
+}
