@@ -1,0 +1,46 @@
+services:
+  meet-recorder:
+    # Placeholder tag. .github/workflows/deploy.yml rewrites this line with the
+    # commit SHA on the `deploy` branch, which is the branch Portainer watches.
+    image: ghcr.io/korjavin/meet-recorder:latest
+    # Every variable config.js reads, passed through by name: Compose takes the
+    # values from .env next to this file, or from the stack environment when
+    # Portainer deploys this repo as a git stack. A variable left unset is not
+    # passed, so the defaults in config.js stand. See .env.example.
+    environment:
+      - RECORDER_SECRET
+      - PORT
+      - BOT_DISPLAY_NAME
+      - JOIN_TIMEOUT_S
+      - MAX_DURATION_S
+      - EMPTY_GRACE_S
+      - LOG_LEVEL
+      # Fixed by the storage layout (docs/architecture.md §6): the shared
+      # recordings volume is mounted at /data, this service writes under meet/.
+      - DATA_DIR=/data/meet
+    volumes:
+      - recordings:/data
+    # Internal only: no ports, no Traefik labels. The orchestrator reaches it
+    # as http://meet-recorder:8080 over the shared network.
+    networks:
+      - traefik
+    # Chromium needs more than Docker's 64 MB default /dev/shm.
+    shm_size: "1g"
+    # On SIGTERM every running job finalizes its WAV and its terminal event is
+    # queued before the process exits; give it time.
+    stop_grace_period: 120s
+    restart: unless-stopped
+    # ponytail: no healthcheck — the image ships no HTTP client. GET /health
+    # exists for the caller; add a probe when the image gains curl anyway.
+
+volumes:
+  # Shared with every stack that touches audio; create it once with
+  # `docker volume create <name>`.
+  recordings:
+    external: true
+    name: ${RECORDINGS_VOLUME:-recordings}
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK_NAME:-traefik}
