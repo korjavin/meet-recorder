@@ -52,7 +52,7 @@ function createOutbox({ secret, dataDir, store, log, backoff = BACKOFF_MS }) {
       // fetch errors may quote the URL, which may carry credentials: log only the kind.
       throw new Error((e.cause && e.cause.code) || e.name);
     }
-    await res.arrayBuffer().catch(() => {}); // drain so the connection can be reused
+    if (res.body) await res.body.cancel().catch(() => {}); // the reply is unused; never buffer it
     if (res.status < 200 || res.status > 299) throw new Error(`http ${res.status}`);
   }
 
