@@ -1,0 +1,13 @@
+{
+  "name": "meet-recorder",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless Google Meet audio recorder",
+  "main": "meet.js",
+  "scripts": {
+    "test": "node --check meet.js && node --test meet.test.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.10.0"
+  }
+}
