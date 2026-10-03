@@ -14,3 +14,19 @@ hints.
 PUPPETEER_SKIP_DOWNLOAD=1 npm ci && npm test
 docker build -t meet-recorder .
 ```
+
+## Running
+
+`node server.js` serves the HTTP API from docs/architecture.md §3 (the image's
+entrypoint). Configuration is env-only, read in `config.js`:
+
+| variable | default | |
+|---|---|---|
+| `RECORDER_SECRET` | — | required; HMAC key for requests and events |
+| `DATA_DIR` | `/data/meet` | one directory per job |
+| `PORT` | `8080` | |
+| `BOT_DISPLAY_NAME` | `NoteTaker` | |
+| `JOIN_TIMEOUT_S` | `1200` | a link sent before the call keeps knocking |
+| `MAX_DURATION_S` | `14400` | |
+| `EMPTY_GRACE_S` | `60` | |
+| `LOG_LEVEL` | `info` | `warn` / `error` drop per-job progress lines |

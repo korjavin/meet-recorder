@@ -16,5 +16,6 @@ RUN npm ci --omit=dev
 COPY *.js ./
 
 # ponytail: runs as root — Chromium already gets --no-sandbox; a non-root user
-# is a later polish. The entrypoint becomes the HTTP server once it exists.
-ENTRYPOINT ["node", "meet.js"]
+# is a later polish.
+EXPOSE 8080
+ENTRYPOINT ["node", "server.js"]
