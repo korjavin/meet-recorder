@@ -7,37 +7,11 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-// Requiring must not launch a browser or run the CLI.
+// Requiring must not launch a browser or touch the process.
 const meet = require('./meet.js');
-const { parseArgs, meetingCode, meetShouldStop, otherNames, readState, finalizeWav, silentWav, RATE, foldCaptions, captionHint, CAPTION_SETTLE_MS } = meet;
+const { record, meetingCode, meetShouldStop, otherNames, readState, finalizeWav, silentWav, RATE, foldCaptions, captionHint, CAPTION_SETTLE_MS } = meet;
 
 const URL = 'https://meet.google.com/abc-defg-hij';
-const MIN = ['--url', URL, '--out', '/tmp/a.wav'];
-
-test('parseArgs takes the flags and defaults', () => {
-  assert.deepStrictEqual(parseArgs(MIN), {
-    url: URL,
-    out: '/tmp/a.wav',
-    joinTimeout: 1200,
-    maxDuration: 14400,
-    emptyGrace: 60,
-    displayName: 'NoteTaker',
-  });
-  const o = parseArgs([...MIN, '--join-timeout', '30', '--max-duration', '90', '--empty-grace', '5', '--display-name', 'Bot', '--tracks-dir', '/tmp/x/tracks']);
-  assert.strictEqual(o.joinTimeout, 30);
-  assert.strictEqual(o.maxDuration, 90);
-  assert.strictEqual(o.emptyGrace, 5);
-  assert.strictEqual(o.displayName, 'Bot');
-});
-
-test('parseArgs takes --captions-out anywhere among the pairs', () => {
-  assert.strictEqual(parseArgs([...MIN, '--captions-out', '/tmp/c.jsonl']).captionsOut, '/tmp/c.jsonl');
-  const o = parseArgs(['--captions-out', '/tmp/c.jsonl', ...MIN, '--join-timeout', '30']);
-  assert.strictEqual(o.captionsOut, '/tmp/c.jsonl');
-  assert.strictEqual(o.joinTimeout, 30);
-  assert.throws(() => parseArgs([...MIN, '--captions-out']), /missing value/);
-  assert.throws(() => parseArgs([...MIN, '--captions-out', '/tmp/../tmp/a.wav']), /differ from --out/);
-});
 
 test('foldCaptions stores each utterance once, with its final text', () => {
   const st = { open: new Map(), done: new Set() };
@@ -86,20 +60,15 @@ test('captionHint: seconds since the recording started, monotonic, never negativ
   assert.strictEqual(captionHint(u(12_000), 10_000, 3.5).offset_s, 3.5, 'out of order clamps to the previous line');
 });
 
-test('parseArgs rejects bad input, including a non-Meet URL', () => {
-  assert.throws(() => parseArgs(['--out', '/tmp/a.wav']), /--url/);
-  assert.throws(() => parseArgs(['--url', URL]), /--out/);
-  assert.throws(() => parseArgs([...MIN, '--nope', '1']), /unknown argument/);
-  assert.throws(() => parseArgs([...MIN, '--join-timeout', '0']), /positive number/);
-  assert.throws(() => parseArgs(['--url', 'https://example.com/room', '--out', '/tmp/a.wav']), /meet\.google\.com/);
-  assert.throws(() => parseArgs(['--url', 'http://meet.google.com/abc-defg-hij', '--out', '/tmp/a.wav']), /meet\.google\.com/);
-});
-
-test('bad arguments exit 2 with the usage on stderr', () => {
-  const r = spawnSync(process.execPath, [path.join(__dirname, 'meet.js'), '--url', 'https://example.com/x', '--out', '/tmp/a.wav'], { encoding: 'utf8' });
-  assert.strictEqual(r.status, 2);
-  assert.match(r.stderr, /usage: meet\.js/);
-  assert.strictEqual(r.stdout, '');
+test('record rejects bad arguments before starting anything', async () => {
+  const out = '/tmp/a.wav';
+  await assert.rejects(record({ out }), TypeError);
+  await assert.rejects(record({ url: 'https://example.com/room', out }), /meet\.google\.com/);
+  await assert.rejects(record({ url: 'http://meet.google.com/abc-defg-hij', out }), /meet\.google\.com/);
+  await assert.rejects(record({ url: URL }), /out is required/);
+  await assert.rejects(record({ url: URL, out, captionsOut: '/tmp/../tmp/a.wav' }), /differ from out/);
+  await assert.rejects(record({ url: URL, out, joinTimeoutS: 0 }), /joinTimeoutS must be a positive number/);
+  await assert.rejects(record({ url: URL, out: '/nonexistent/a.wav', signal: AbortSignal.abort() }), { code: 'not_admitted' }, 'already aborted: nothing starts');
 });
 
 test('meetingCode logs the code, never the rest of the URL', () => {
@@ -195,12 +164,12 @@ test('finalizeWav repairs placeholder sizes and reports the PCM bytes', () => {
 });
 
 // --- end to end against a fake Meet ------------------------------------------
-// Runs meet.js's main() with a real Chromium, PulseAudio and parec, but serves a
+// Runs record() with a real Chromium, PulseAudio and parec, but serves a
 // fake Meet page in place of meet.google.com (request interception, no network).
 // The page plays a beeping tone the way Meet does — a remote WebRTC track played
 // through WebAudio — so this proves the capture path: fake devices, the null
 // sink, parec, the WAV. It also enforces the hard rule: the page refuses the bot
-// (=> exit 3) if it knocks with the mic or camera on, or if a captured track can
+// (=> not_admitted) if it knocks with the mic or camera on, or if a captured track can
 // be re-enabled. Skipped where Chromium or pulseaudio is missing (the CI node
 // job); runs in the Docker image:
 //   docker run --rm --shm-size=512m --entrypoint node <image> --test meet.test.js
@@ -291,9 +260,9 @@ function canRunBrowser() {
   }
 }
 
-let fakePage = null; // the page main() drives, for tests that break it
+let fakePage = null; // the page record() drives, for tests that break it
 
-/** Serve FAKE_MEET for meet.google.com on every page main() opens. */
+/** Serve FAKE_MEET for meet.google.com on every page record() opens. */
 function fakeMeet() {
   const puppeteer = require('puppeteer');
   const launch = puppeteer.launch.bind(puppeteer);
@@ -310,20 +279,6 @@ function fakeMeet() {
   return () => (puppeteer.launch = launch);
 }
 
-/** main() in-process with stdout captured; `during(out)` runs while it records. */
-async function runMain(args, during) {
-  const writes = [];
-  const write = process.stdout.write;
-  process.stdout.write = (s, ...rest) => (String(s).startsWith('{') ? writes.push(String(s)) : write.call(process.stdout, s, ...rest));
-  try {
-    const p = meet.main(args);
-    if (during) await during();
-    return { code: await p, stdout: writes.join('') };
-  } finally {
-    process.stdout.write = write;
-  }
-}
-
 /** RMS of a 16-bit PCM WAV in dBFS. */
 function wavDb(file) {
   const b = fs.readFileSync(file);
@@ -336,24 +291,41 @@ function wavDb(file) {
 
 const skip = canRunBrowser() ? false : 'needs Chromium + pulseaudio + parec (run in the Docker image)';
 
-test('end to end: knocks muted, records the call audio, SIGTERM finalizes the WAV', { skip, timeout: 120000 }, async () => {
+const waitFor = async (file) => {
+  for (let i = 0; i < 300 && !fs.existsSync(file); i++) await new Promise((r) => setTimeout(r, 100));
+};
+const PROCESS_EVENTS = ['SIGTERM', 'SIGINT', 'SIGHUP', 'exit'];
+const listeners = () => PROCESS_EVENTS.map((e) => process.listenerCount(e));
+
+/** Run `fn(dir)` with the fake Meet served, then check record() left no process handlers. */
+async function e2e(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-e2e-'));
   const restore = fakeMeet();
+  const before = listeners();
   try {
+    await fn(dir);
+    assert.deepStrictEqual(listeners(), before, 'record() owns no process-level handlers');
+  } finally {
+    restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('end to end: knocks muted, records the call audio, abort finalizes the WAV', { skip, timeout: 120000 }, () =>
+  e2e(async (dir) => {
     const out = path.join(dir, 'job', 'audio.wav');
     const captions = path.join(dir, 'job', 'captions.jsonl');
-    const { code, stdout } = await runMain(['--url', URL, '--out', out, '--join-timeout', '60', '--captions-out', captions], async () => {
-      for (let i = 0; i < 300 && !fs.existsSync(out); i++) await new Promise((r) => setTimeout(r, 100));
-      await new Promise((r) => setTimeout(r, 6000)); // record ~6 s
-      process.emit('SIGTERM', 'SIGTERM');
-    });
-    assert.strictEqual(code, 0);
-    const res = JSON.parse(stdout);
-    assert.strictEqual(res.out, out);
+    const ac = new AbortController();
+    const states = [];
+    const p = record({ url: URL, out, captionsOut: captions, joinTimeoutS: 60, signal: ac.signal, onState: (s) => states.push(s) });
+    await waitFor(out);
+    await new Promise((r) => setTimeout(r, 6000)); // record ~6 s
+    ac.abort();
+    const res = await p;
+    assert.deepStrictEqual(states, ['waiting_in_lobby', 'joined']);
     assert.strictEqual(res.reason, 'signal');
     assert.deepStrictEqual(res.participants, ['Alice']);
-    assert.ok(res.duration_s > 3, `duration ${res.duration_s}`);
-    assert.strictEqual(res.tracks, undefined);
+    assert.ok(res.durationS > 3, `duration ${res.durationS}`);
     assert.strictEqual(res.captions, captions);
     const hints = fs.readFileSync(captions, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     assert.deepStrictEqual(hints.map((h) => [h.speaker, h.text]), [['Alice', 'Hello everyone'], ['Bob', 'Hi Alice']]);
@@ -364,49 +336,33 @@ test('end to end: knocks muted, records the call audio, SIGTERM finalizes the WA
     assert.strictEqual(b.readUInt16LE(22), 1, 'mono');
     const db = wavDb(out);
     assert.ok(db > -30, `call audio captured: ${db.toFixed(1)} dBFS`);
-  } finally {
-    restore();
-    process.removeAllListeners('SIGTERM');
-    process.removeAllListeners('SIGINT');
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
+  }));
 
-test('end to end: stops on its own once the room is empty', { skip, timeout: 120000 }, async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-e2e-'));
-  const restore = fakeMeet();
-  try {
-    const out = path.join(dir, 'audio.wav');
-    const { code, stdout } = await runMain(['--url', `${URL}?aliceLeavesAfter=8`, '--out', out, '--join-timeout', '60', '--empty-grace', '2']);
-    assert.strictEqual(code, 0);
-    const res = JSON.parse(stdout);
-    assert.strictEqual(res.reason, 'empty_room');
-    assert.strictEqual(res.captions, undefined, 'no --captions-out, no captions key');
-    assert.deepStrictEqual(res.participants, ['Alice']);
-  } finally {
-    restore();
-    process.removeAllListeners('SIGTERM');
-    process.removeAllListeners('SIGINT');
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
+test('end to end: two concurrent runs each stop on their own once the room is empty', { skip, timeout: 120000 }, () =>
+  e2e(async (dir) => {
+    const run = (n) => record({ url: `${URL}?aliceLeavesAfter=8`, out: path.join(dir, `${n}.wav`), joinTimeoutS: 60, emptyGraceS: 2 });
+    for (const res of await Promise.all([run(1), run(2)])) {
+      assert.strictEqual(res.reason, 'empty_room');
+      assert.strictEqual(res.captions, undefined, 'no captionsOut, no captions');
+      assert.deepStrictEqual(res.participants, ['Alice']);
+    }
+  }));
 
-test('end to end: the Meet page dying mid-call is a truncated recording (exit 5)', { skip, timeout: 120000 }, async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meet-e2e-'));
-  const restore = fakeMeet();
-  try {
+test('end to end: an abort before admission is not_admitted', { skip, timeout: 120000 }, () =>
+  e2e(async (dir) => {
+    const ac = new AbortController();
+    const p = record({ url: URL, out: path.join(dir, 'audio.wav'), joinTimeoutS: 60, signal: ac.signal });
+    setTimeout(() => ac.abort(), 1000);
+    await assert.rejects(p, { code: 'not_admitted' });
+  }));
+
+test('end to end: the Meet page dying mid-call is recorder_failed, the partial WAV kept', { skip, timeout: 120000 }, () =>
+  e2e(async (dir) => {
     const out = path.join(dir, 'audio.wav');
-    const { code, stdout } = await runMain(['--url', URL, '--out', out, '--join-timeout', '60'], async () => {
-      for (let i = 0; i < 300 && !fs.existsSync(out); i++) await new Promise((r) => setTimeout(r, 100));
-      await new Promise((r) => setTimeout(r, 2000));
-      await fakePage.close();
-    });
-    assert.strictEqual(code, 5);
-    assert.strictEqual(stdout, '');
-  } finally {
-    restore();
-    process.removeAllListeners('SIGTERM');
-    process.removeAllListeners('SIGINT');
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
+    const p = record({ url: URL, out, joinTimeoutS: 60 });
+    await waitFor(out);
+    await new Promise((r) => setTimeout(r, 2000));
+    await fakePage.close();
+    await assert.rejects(p, (e) => e.code === 'recorder_failed' && e.durationS > 0);
+    assert.ok(fs.statSync(out).size > 44, 'the truncated WAV is kept');
+  }));
