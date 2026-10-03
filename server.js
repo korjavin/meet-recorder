@@ -132,7 +132,12 @@ function partialArtifacts(dir) {
       return 0;
     }
   };
-  const pcm = finalizeWav(audio);
+  let pcm;
+  try {
+    pcm = finalizeWav(audio);
+  } catch {
+    pcm = size(audio) - 44; // repair is best effort: the file is still kept and reported
+  }
   if (size(audio) <= 44) return { durationS: null, artifacts: [] };
   const artifacts = [{ kind: 'audio', path: audio, format: 'wav' }];
   if (size(captions) > 0) artifacts.push({ kind: 'captions', path: captions });
