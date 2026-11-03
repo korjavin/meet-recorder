@@ -2,7 +2,7 @@ services:
   meet-recorder:
     # Placeholder tag. .github/workflows/deploy.yml rewrites this line with the
     # commit SHA on the `deploy` branch, which is the branch Portainer watches.
-    image: ghcr.io/korjavin/meet-recorder:latest
+    image: ghcr.io/korjavin/meet-recorder:95ed2f05c9a552937453a30355b0a7a014b6af72
     init: true
     deploy:
       resources:
